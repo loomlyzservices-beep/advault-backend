@@ -27,6 +27,16 @@ CREATE TABLE IF NOT EXISTS sessions (
   revoked INTEGER NOT NULL DEFAULT 0
 );
 
+-- Admin sessions are completely separate from user sessions/tokens on purpose:
+-- the admin account is not a row in `users` and must never be reachable via
+-- the regular login flow or share a browser-storage key with a user session.
+CREATE TABLE IF NOT EXISTS admin_sessions (
+  token TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  revoked INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS ads (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,               -- admin-only label, never sent to non-admin clients
