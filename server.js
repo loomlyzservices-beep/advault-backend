@@ -28,20 +28,23 @@ const db = new Database(DB_PATH)
 db.pragma('journal_mode = WAL')
 db.exec(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'))
 
+// Lightweight migration for DBs created before the webhook feature existed.
+const withdrawalCols = db.prepare("PRAGMA table_info(withdrawals)").all().map(c => c.name)
+if(!withdrawalCols.includes('reference')){
+  db.exec('ALTER TABLE withdrawals ADD COLUMN reference TEXT')
+}
+
 function todayStr(){ return new Date().toISOString().slice(0, 10) }
 function newToken(){ return crypto.randomBytes(32).toString('hex') }
 function round2(n){ return Math.round(n * 100) / 100 }
 
-// Ensure the admin account exists / has the configured password
-const existingAdmin = db.prepare('SELECT id FROM users WHERE username = ?').get(ADMIN_USERNAME)
-if(!existingAdmin){
-  db.prepare(`INSERT INTO users (username, email, password_hash, is_admin, last_ad_reset_date)
-              VALUES (?, ?, ?, 1, ?)`)
-    .run(ADMIN_USERNAME, 'admin@advault.local', bcrypt.hashSync(ADMIN_PASSWORD, 10), todayStr())
-} else {
-  db.prepare('UPDATE users SET password_hash = ?, is_admin = 1 WHERE username = ?')
-    .run(bcrypt.hashSync(ADMIN_PASSWORD, 10), ADMIN_USERNAME)
-}
+// Admin is NOT a row in `users` — it authenticates directly against
+// ADMIN_USERNAME/ADMIN_PASSWORD env vars via a completely separate session
+// system (see /api/admin/login below). If an older deployment already has a
+// legacy admin user row, remove it so it can never show up as a "regular
+// account" in the app or be reached through the normal login flow.
+db.prepare('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE is_admin = 1)').run()
+db.prepare('DELETE FROM users WHERE is_admin = 1').run()
 
 function getSetting(key, fallback){
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key)
@@ -98,7 +101,10 @@ function publicAd(ad){
 
 const app = express()
 app.use(cors())
-app.use(express.json({ limit: '25mb' })) // generous limit to allow small base64 file uploads
+app.use(express.json({
+  limit: '25mb', // generous limit to allow small base64 file uploads
+  verify: (req, res, buf) => { req.rawBody = buf }, // needed to verify Paystack webhook signatures
+}))
 
 // ---------------------------------------------------------------------------
 // Auth middleware
@@ -122,8 +128,20 @@ function requireAuth(req, res, next){
   req.sessionToken = token
   next()
 }
-function requireAdmin(req, res, next){
-  if(!req.user.is_admin) return res.status(403).json({ error: 'Admin access required' })
+// Completely separate from user auth: checks the Bearer token against
+// admin_sessions, never against the users table. This is the only way
+// admin routes can be reached.
+function requireAdminSession(req, res, next){
+  const authHeader = req.headers.authorization || ''
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+  if(!token) return res.status(401).json({ error: 'Missing admin session token' })
+
+  const session = db.prepare('SELECT * FROM admin_sessions WHERE token = ?').get(token)
+  if(!session) return res.status(401).json({ error: 'Invalid admin session' })
+  if(session.revoked) return res.status(401).json({ error: 'Admin session revoked — please log in again' })
+  if(new Date(session.expires_at) < new Date()) return res.status(401).json({ error: 'Admin session expired' })
+
+  req.adminSessionToken = token
   next()
 }
 
@@ -249,6 +267,41 @@ app.post('/api/auth/login', (req, res) => {
 
 app.post('/api/auth/logout', requireAuth, (req, res) => {
   db.prepare('UPDATE sessions SET revoked = 1 WHERE token = ?').run(req.sessionToken)
+  res.json({ ok: true })
+})
+
+// ---------------------------------------------------------------------------
+// Admin auth — entirely separate system from user accounts/sessions.
+// Credentials are checked directly against env vars (no DB row for admin),
+// and the resulting token only ever lives in admin_sessions, never `sessions`.
+// Sessions are short-lived (12h) specifically to limit exposure if a device
+// used to log into the admin panel is later shared or left unattended.
+// ---------------------------------------------------------------------------
+app.post('/api/admin/login', (req, res) => {
+  const { username, password } = req.body || {}
+  if(!username || !password) return res.status(400).json({ error: 'Username and password are required.' })
+
+  const userBuf = Buffer.from(String(username))
+  const adminUserBuf = Buffer.from(ADMIN_USERNAME)
+  const usernameMatches = userBuf.length === adminUserBuf.length && crypto.timingSafeEqual(userBuf, adminUserBuf)
+  const passwordMatches = String(password) === ADMIN_PASSWORD
+
+  if(!usernameMatches || !passwordMatches){
+    return res.status(401).json({ error: 'Incorrect admin username or password.' })
+  }
+
+  const token = newToken()
+  const expires = new Date(Date.now() + 12 * 3600 * 1000).toISOString() // 12h, not 30d
+  db.prepare('INSERT INTO admin_sessions (token, expires_at) VALUES (?, ?)').run(token, expires)
+  res.json({ token })
+})
+
+app.post('/api/admin/logout', requireAdminSession, (req, res) => {
+  db.prepare('UPDATE admin_sessions SET revoked = 1 WHERE token = ?').run(req.adminSessionToken)
+  res.json({ ok: true })
+})
+
+app.get('/api/admin/session', requireAdminSession, (req, res) => {
   res.json({ ok: true })
 })
 
@@ -403,17 +456,19 @@ app.post('/api/withdraw', requireAuth, async (req, res) => {
   }
 
   // Withdrawal row starts as 'pending' — only flipped to 'completed' once Paystack
-  // confirms the transfer. Balance is zeroed at the same time the row is created,
-  // inside one transaction, to avoid double-spending on a retried request.
+  // confirms the transfer (either in the immediate response or via webhook later).
+  // Balance is zeroed at the same time the row is created, inside one transaction,
+  // to avoid double-spending on a retried request.
+  const reference = `advault_wd_${req.user.id}_${Date.now()}`
   const insertPending = db.prepare(
-    'INSERT INTO withdrawals (user_id, amount, phone, status) VALUES (?, ?, ?, ?)'
+    'INSERT INTO withdrawals (user_id, amount, phone, status, reference) VALUES (?, ?, ?, ?, ?)'
   )
   let withdrawalId
   const lock = db.transaction(() => {
     const fresh = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.user.id)
     if(fresh.balance <= 0) throw new Error('EMPTY_BALANCE')
     db.prepare('UPDATE users SET balance = 0 WHERE id = ?').run(req.user.id)
-    withdrawalId = insertPending.run(req.user.id, amount, cleanPhone, 'pending').lastInsertRowid
+    withdrawalId = insertPending.run(req.user.id, amount, cleanPhone, 'pending', reference).lastInsertRowid
   })
   try{ lock() } catch(e){
     if(e.message === 'EMPTY_BALANCE') return res.status(400).json({ error: 'Your balance is empty.' })
@@ -445,7 +500,7 @@ app.post('/api/withdraw', requireAuth, async (req, res) => {
         amount: Math.round(amount * 100),
         recipient: recipientCode,
         reason: 'Advault withdrawal',
-        reference: `advault_wd_${withdrawalId}_${Date.now()}`,
+        reference,
       }),
     })
     if(!transferRes.ok){
@@ -480,6 +535,48 @@ app.post('/api/withdraw', requireAuth, async (req, res) => {
 })
 
 // ---------------------------------------------------------------------------
+// Paystack webhook — the reliable source of truth for transfer status.
+// Set this exact URL in Paystack Dashboard → Settings → API Keys & Webhooks:
+//   https://YOUR-BACKEND-URL/api/webhook/paystack
+// ---------------------------------------------------------------------------
+app.post('/api/webhook/paystack', (req, res) => {
+  // Verify the request genuinely came from Paystack using the raw body + secret key.
+  const signature = req.headers['x-paystack-signature']
+  if(!PAYSTACK_SECRET_KEY || !signature || !req.rawBody){
+    return res.status(400).json({ error: 'Invalid webhook request.' })
+  }
+  const expected = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.rawBody).digest('hex')
+  if(expected !== signature){
+    return res.status(401).json({ error: 'Invalid signature.' })
+  }
+
+  // Acknowledge immediately — Paystack retries if it doesn't get a fast 200.
+  res.sendStatus(200)
+
+  const event = req.body?.event
+  const data = req.body?.data
+  const reference = data?.reference
+  if(!reference || !['transfer.success', 'transfer.failed', 'transfer.reversed'].includes(event)) return
+
+  const withdrawal = db.prepare('SELECT * FROM withdrawals WHERE reference = ?').get(reference)
+  if(!withdrawal || withdrawal.status !== 'pending') return // already handled, or not ours
+
+  if(event === 'transfer.success'){
+    db.transaction(() => {
+      db.prepare('UPDATE withdrawals SET status = ? WHERE id = ?').run('completed', withdrawal.id)
+      db.prepare('UPDATE users SET total_paid_out = total_paid_out + ? WHERE id = ?')
+        .run(withdrawal.amount, withdrawal.user_id)
+    })()
+  } else {
+    // transfer.failed or transfer.reversed — refund the user, it never arrived.
+    db.transaction(() => {
+      db.prepare('UPDATE withdrawals SET status = ? WHERE id = ?').run('failed', withdrawal.id)
+      db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(withdrawal.amount, withdrawal.user_id)
+    })()
+  }
+})
+
+// ---------------------------------------------------------------------------
 // Winners feed (cosmetic/social proof — real recent payouts, names anonymized)
 // ---------------------------------------------------------------------------
 app.get('/api/winners', (req, res) => {
@@ -496,7 +593,7 @@ app.get('/api/winners', (req, res) => {
 // ADMIN ROUTES
 // =============================================================================
 const admin = express.Router()
-admin.use(requireAuth, requireAdmin)
+admin.use(requireAdminSession)
 
 admin.get('/overview', (req, res) => {
   const totalUsers = db.prepare('SELECT COUNT(*) c FROM users WHERE is_admin = 0 AND is_guest = 0').get().c
