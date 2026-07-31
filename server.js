@@ -365,25 +365,118 @@ app.post('/api/tiers/purchase', requireAuth, async (req, res) => {
 })
 
 // ---------------------------------------------------------------------------
-// Withdrawals
+// Withdrawals — real Paystack Mobile Money transfer
 // ---------------------------------------------------------------------------
-app.post('/api/withdraw', requireAuth, (req, res) => {
-  const { phone } = req.body || {}
+// Ghana mobile money bank codes recognised by Paystack's transfer recipient API.
+const MOMO_BANK_CODES = { mtn: 'MTN', vodafone: 'VOD', telecel: 'VOD', airteltigo: 'ATL' }
+
+async function paystackFetch(urlPath, options){
+  const r = await fetch(`https://api.paystack.co${urlPath}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+      'Content-Type': 'application/json',
+      ...(options?.headers || {}),
+    },
+  })
+  const data = await r.json().catch(() => ({}))
+  return { ok: r.ok && data?.status !== false, data }
+}
+
+app.post('/api/withdraw', requireAuth, async (req, res) => {
+  const { phone, network } = req.body || {}
   if(!req.user.tier) return res.status(403).json({ error: 'Buy a tier to unlock withdrawals.' })
   if(req.user.balance <= 0) return res.status(400).json({ error: 'Your balance is empty.' })
 
   const amount = round2(req.user.balance)
-  // SIMULATED payout. A real transfer requires the Paystack Transfers API
-  // (recipient creation + transfer initiation) using PAYSTACK_SECRET_KEY —
-  // wire that up here before going live with real money.
-  const tx = db.transaction(() => {
-    db.prepare('UPDATE users SET balance = 0 WHERE id = ?').run(req.user.id)
-    db.prepare('INSERT INTO withdrawals (user_id, amount, phone) VALUES (?, ?, ?)').run(req.user.id, amount, phone || null)
-  })
-  tx()
+  const cleanPhone = String(phone || req.user.phone || '').replace(/[^\d]/g, '')
+  const bankCode = MOMO_BANK_CODES[String(network || '').toLowerCase()]
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id)
-  res.json({ amount, user: publicUser(user) })
+  if(!cleanPhone || cleanPhone.length < 9){
+    return res.status(400).json({ error: 'A valid mobile money number is required.' })
+  }
+  if(!bankCode){
+    return res.status(400).json({ error: 'Select a valid mobile money network (MTN, Vodafone/Telecel, or AirtelTigo).' })
+  }
+  if(!PAYSTACK_SECRET_KEY){
+    return res.status(503).json({ error: 'Payouts are not configured yet. Try again shortly.' })
+  }
+
+  // Withdrawal row starts as 'pending' — only flipped to 'completed' once Paystack
+  // confirms the transfer. Balance is zeroed at the same time the row is created,
+  // inside one transaction, to avoid double-spending on a retried request.
+  const insertPending = db.prepare(
+    'INSERT INTO withdrawals (user_id, amount, phone, status) VALUES (?, ?, ?, ?)'
+  )
+  let withdrawalId
+  const lock = db.transaction(() => {
+    const fresh = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.user.id)
+    if(fresh.balance <= 0) throw new Error('EMPTY_BALANCE')
+    db.prepare('UPDATE users SET balance = 0 WHERE id = ?').run(req.user.id)
+    withdrawalId = insertPending.run(req.user.id, amount, cleanPhone, 'pending').lastInsertRowid
+  })
+  try{ lock() } catch(e){
+    if(e.message === 'EMPTY_BALANCE') return res.status(400).json({ error: 'Your balance is empty.' })
+    throw e
+  }
+
+  try{
+    // 1. Create a transfer recipient for this mobile money number.
+    const recipientRes = await paystackFetch('/transferrecipient', {
+      method: 'POST',
+      body: JSON.stringify({
+        type: 'mobile_money',
+        name: req.user.username,
+        account_number: cleanPhone,
+        bank_code: bankCode,
+        currency: 'GHS',
+      }),
+    })
+    if(!recipientRes.ok){
+      throw new Error(recipientRes.data?.message || 'Could not register mobile money recipient.')
+    }
+    const recipientCode = recipientRes.data.data.recipient_code
+
+    // 2. Initiate the transfer.
+    const transferRes = await paystackFetch('/transfer', {
+      method: 'POST',
+      body: JSON.stringify({
+        source: 'balance',
+        amount: Math.round(amount * 100),
+        recipient: recipientCode,
+        reason: 'Advault withdrawal',
+        reference: `advault_wd_${withdrawalId}_${Date.now()}`,
+      }),
+    })
+    if(!transferRes.ok){
+      throw new Error(transferRes.data?.message || 'Transfer could not be initiated.')
+    }
+
+    const transferStatus = transferRes.data?.data?.status // 'success' | 'pending' | 'otp' | ...
+    const finalStatus = transferStatus === 'success' ? 'completed' : 'pending'
+    db.prepare('UPDATE withdrawals SET status = ? WHERE id = ?').run(finalStatus, withdrawalId)
+    if(finalStatus === 'completed'){
+      db.prepare('UPDATE users SET total_paid_out = total_paid_out + ? WHERE id = ?').run(amount, req.user.id)
+    }
+
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id)
+    return res.json({
+      amount,
+      status: finalStatus,
+      message: finalStatus === 'completed'
+        ? 'Withdrawal sent successfully.'
+        : 'Withdrawal is processing — funds will arrive shortly.',
+      user: publicUser(user),
+    })
+  }catch(err){
+    // Refund the balance and mark the withdrawal as failed — never let the user
+    // lose their balance for a transfer that didn't actually go out.
+    db.transaction(() => {
+      db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(amount, req.user.id)
+      db.prepare('UPDATE withdrawals SET status = ? WHERE id = ?').run('failed', withdrawalId)
+    })()
+    return res.status(502).json({ error: err.message || 'Withdrawal failed. Your balance has been restored.' })
+  }
 })
 
 // ---------------------------------------------------------------------------
