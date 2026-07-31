@@ -41,10 +41,24 @@ function round2(n){ return Math.round(n * 100) / 100 }
 // Admin is NOT a row in `users` — it authenticates directly against
 // ADMIN_USERNAME/ADMIN_PASSWORD env vars via a completely separate session
 // system (see /api/admin/login below). If an older deployment already has a
-// legacy admin user row, remove it so it can never show up as a "regular
-// account" in the app or be reached through the normal login flow.
-db.prepare('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE is_admin = 1)').run()
-db.prepare('DELETE FROM users WHERE is_admin = 1').run()
+// legacy admin user row, remove it (and anything referencing it) so it can
+// never show up as a "regular account" or be reached through normal login.
+// Wrapped defensively: this is one-time cleanup and must never crash startup.
+try{
+  const legacyAdminIds = db.prepare('SELECT id FROM users WHERE is_admin = 1').all().map(r => r.id)
+  if(legacyAdminIds.length){
+    const placeholders = legacyAdminIds.map(() => '?').join(',')
+    db.transaction(() => {
+      db.prepare(`DELETE FROM sessions WHERE user_id IN (${placeholders})`).run(...legacyAdminIds)
+      db.prepare(`DELETE FROM ad_watches WHERE user_id IN (${placeholders})`).run(...legacyAdminIds)
+      db.prepare(`DELETE FROM transactions WHERE user_id IN (${placeholders})`).run(...legacyAdminIds)
+      db.prepare(`DELETE FROM withdrawals WHERE user_id IN (${placeholders})`).run(...legacyAdminIds)
+      db.prepare(`DELETE FROM users WHERE id IN (${placeholders})`).run(...legacyAdminIds)
+    })()
+  }
+}catch(err){
+  console.error('Legacy admin cleanup skipped (non-fatal):', err.message)
+}
 
 function getSetting(key, fallback){
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key)
